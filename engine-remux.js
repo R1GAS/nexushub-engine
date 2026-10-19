@@ -197,16 +197,37 @@ function getRemuxCapabilities() {
   };
 }
 
+/** Decode/encode threads. Unset uses 2 so one playback cannot occupy every core. */
+function ffmpegThreadCount() {
+  const raw = Number(process.env.NEXUSHUB_FFMPEG_THREADS);
+  if (Number.isInteger(raw) && raw >= 1 && raw <= 8) return String(raw);
+  return "2";
+}
+
+function deprioritizeRemux(child) {
+  const pid = child && child.pid;
+  const below = os.constants && os.constants.priority && os.constants.priority.PRIORITY_BELOW_NORMAL;
+  if (!pid || below == null || typeof os.setPriority !== "function") return;
+  try {
+    os.setPriority(pid, below);
+  } catch {
+    /* priority is best-effort */
+  }
+}
+
 /** Fixed templates only — never built from user query strings. */
 function buildFfmpegArgs(targetUrl, { transcodeVideo = false } = {}) {
+  const threads = ffmpegThreadCount();
   const videoArgs = transcodeVideo
-    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-threads", threads]
     : ["-c:v", "copy"];
   return [
     "-hide_banner",
     "-loglevel",
     "error",
     "-nostdin",
+    "-threads",
+    threads,
     "-user_agent",
     process.env.NEXUSHUB_PROXY_UA || "VLC/3.0.20 LibVLC/3.0.20",
     "-i",
@@ -312,6 +333,7 @@ async function startRemuxStream(targetUrl, res, baseHeaders = {}, options = {}) 
     return { ok: false, status: 500, error: String((error && error.message) || error) };
   }
 
+  deprioritizeRemux(remuxChild);
   const cleanup = (why) => stopRemux(why || "cleanup");
 
   remuxChild.stderr.on("data", (chunk) => {
