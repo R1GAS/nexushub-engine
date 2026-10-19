@@ -390,6 +390,9 @@ function parseRemuxQuery(searchParams) {
   }
   const target = searchParams.get("url");
   if (!target) return { ok: false, status: 400, error: "Missing ?url=" };
+  if (/\.m3u8?(?:\?|#|$)/i.test(String(target))) {
+    return { ok: false, status: 415, error: "HLS playlists are not remuxed" };
+  }
 
   const vcodec = String(searchParams.get("vcodec") || "").trim().toLowerCase();
   if (vcodec && vcodec !== "h264") {
