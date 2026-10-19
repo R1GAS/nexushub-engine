@@ -197,16 +197,158 @@ function getRemuxCapabilities() {
   };
 }
 
+/** Decode/encode threads. Copy remux defaults to 1; a video encode defaults to 2. */
+function ffmpegThreadCount(transcodeVideo) {
+  const raw = Number(process.env.NEXUSHUB_FFMPEG_THREADS);
+  if (Number.isInteger(raw) && raw >= 1 && raw <= 8) return String(raw);
+  return transcodeVideo ? "2" : "1";
+}
+
+const COPY_AUDIO_CODECS = new Set(["aac", "mp3", "mp4a", "opus", "vorbis", "libopus"]);
+const CHEAP_AUDIO_CODECS = new Set(["ac3", "eac3"]);
+const HEAVY_AUDIO_CODECS = new Set(["truehd", "dts", "mlp"]);
+
+function safeAudioMap(map) {
+  const raw = String(map || "");
+  if (/^0:\d+$/.test(raw) || raw === "0:a:0?") return raw;
+  return "0:a:0?";
+}
+
+/**
+ * Pick the cheap path for a probed file.
+ * 1440p/4K is never re-encoded. AAC/MP3/Opus is copied.
+ * TrueHD/DTS prefers a sibling AC3/EAC3 track so the lossless track is not decoded.
+ */
+function planRemux(streams, { transcodeVideo = false } = {}) {
+  const list = Array.isArray(streams) ? streams : [];
+  const video = list.find((stream) => stream && stream.codec_type === "video");
+  const height = Number(video && video.height) || 0;
+  const encodeVideo = Boolean(transcodeVideo) && height < 1440;
+  const audio = list.filter(
+    (stream) =>
+      stream &&
+      stream.codec_type === "audio" &&
+      stream.codec_name &&
+      Number.isInteger(Number(stream.index))
+  );
+  const copyable = audio.find((stream) => COPY_AUDIO_CODECS.has(String(stream.codec_name).toLowerCase()));
+  if (copyable) {
+    return { transcodeVideo: encodeVideo, copyAudio: true, audioMap: `0:${Number(copyable.index)}` };
+  }
+  const first = audio[0];
+  const firstHeavy = first && HEAVY_AUDIO_CODECS.has(String(first.codec_name).toLowerCase());
+  if (firstHeavy) {
+    const cheap = audio.find((stream) => CHEAP_AUDIO_CODECS.has(String(stream.codec_name).toLowerCase()));
+    if (cheap) {
+      return { transcodeVideo: encodeVideo, copyAudio: false, audioMap: `0:${Number(cheap.index)}` };
+    }
+  }
+  if (first) {
+    return { transcodeVideo: encodeVideo, copyAudio: false, audioMap: `0:${Number(first.index)}` };
+  }
+  return { transcodeVideo: encodeVideo, copyAudio: false, audioMap: "0:a:0?" };
+}
+
+function resolveFfprobePath(ffmpegBin) {
+  const bin = String(ffmpegBin || "");
+  const base = path.basename(bin).toLowerCase();
+  if (bin && base !== "ffmpeg" && base !== "ffmpeg.exe") {
+    const sibling = path.join(path.dirname(bin), process.platform === "win32" ? "ffprobe.exe" : "ffprobe");
+    try {
+      if (fs.existsSync(sibling)) return sibling;
+    } catch {
+      /* ignore */
+    }
+  }
+  return process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+}
+
+function probeStreams(ffprobeBin, targetUrl) {
+  return new Promise((resolve) => {
+    let child = null;
+    let stdout = "";
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      finish(null);
+    }, 8000);
+    try {
+      child = spawn(
+        ffprobeBin,
+        [
+          "-v",
+          "error",
+          "-probesize",
+          "5000000",
+          "-analyzeduration",
+          "1000000",
+          "-show_entries",
+          "stream=index,codec_type,codec_name,height",
+          "-of",
+          "json",
+          String(targetUrl),
+        ],
+        { windowsHide: true, shell: false, stdio: ["ignore", "pipe", "ignore"] }
+      );
+    } catch {
+      finish(null);
+      return;
+    }
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk || "");
+      if (stdout.length > 200000) stdout = stdout.slice(-200000);
+    });
+    child.on("error", () => finish(null));
+    child.on("close", () => {
+      try {
+        const parsed = JSON.parse(stdout);
+        finish(Array.isArray(parsed.streams) ? parsed.streams : null);
+      } catch {
+        finish(null);
+      }
+    });
+  });
+}
+
+function deprioritizeRemux(child) {
+  const pid = child && child.pid;
+  const below = os.constants && os.constants.priority && os.constants.priority.PRIORITY_BELOW_NORMAL;
+  if (!pid || below == null || typeof os.setPriority !== "function") return;
+  try {
+    os.setPriority(pid, below);
+  } catch {
+    /* priority is best-effort */
+  }
+}
+
 /** Fixed templates only — never built from user query strings. */
-function buildFfmpegArgs(targetUrl, { transcodeVideo = false } = {}) {
+function buildFfmpegArgs(targetUrl, { transcodeVideo = false, copyAudio = false, audioMap = "0:a:0?" } = {}) {
+  const threads = ffmpegThreadCount(transcodeVideo);
   const videoArgs = transcodeVideo
-    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+    ? ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23", "-pix_fmt", "yuv420p", "-threads", threads]
     : ["-c:v", "copy"];
+  const audioArgs = copyAudio ? ["-c:a", "copy"] : ["-c:a", "aac", "-ac", "2", "-b:a", "192k"];
   return [
     "-hide_banner",
     "-loglevel",
     "error",
     "-nostdin",
+    "-threads",
+    threads,
+    "-probesize",
+    "5000000",
+    "-analyzeduration",
+    "1000000",
     "-user_agent",
     process.env.NEXUSHUB_PROXY_UA || "VLC/3.0.20 LibVLC/3.0.20",
     "-i",
@@ -214,14 +356,9 @@ function buildFfmpegArgs(targetUrl, { transcodeVideo = false } = {}) {
     "-map",
     "0:v:0",
     "-map",
-    "0:a:0?",
+    safeAudioMap(audioMap),
     ...videoArgs,
-    "-c:a",
-    "aac",
-    "-ac",
-    "2",
-    "-b:a",
-    "192k",
+    ...audioArgs,
     "-sn",
     "-dn",
     "-movflags",
@@ -284,7 +421,17 @@ async function startRemuxStream(targetUrl, res, baseHeaders = {}, options = {}) 
 
   const transcodeVideo = Boolean(options && options.transcodeVideo);
   const bin = resolveFfmpegPath();
-  const args = buildFfmpegArgs(targetUrl, { transcodeVideo });
+  let plan = { transcodeVideo, copyAudio: false, audioMap: "0:a:0?" };
+  try {
+    const streams = await probeStreams(resolveFfprobePath(bin), targetUrl);
+    if (streams) plan = planRemux(streams, { transcodeVideo });
+  } catch {
+    /* header probe is optional; fall back to copy-video + AAC */
+  }
+  const args = buildFfmpegArgs(targetUrl, plan);
+  console.log(
+    `  ↳ remux plan video=${plan.transcodeVideo ? "encode" : "copy"} audio=${plan.copyAudio ? "copy" : "aac"} map=${plan.audioMap}`
+  );
   remuxHost = remuxHostOf(targetUrl);
   remuxStartedAt = Date.now();
 
@@ -312,6 +459,7 @@ async function startRemuxStream(targetUrl, res, baseHeaders = {}, options = {}) 
     return { ok: false, status: 500, error: String((error && error.message) || error) };
   }
 
+  deprioritizeRemux(remuxChild);
   const cleanup = (why) => stopRemux(why || "cleanup");
 
   remuxChild.stderr.on("data", (chunk) => {
@@ -390,6 +538,9 @@ function parseRemuxQuery(searchParams) {
   }
   const target = searchParams.get("url");
   if (!target) return { ok: false, status: 400, error: "Missing ?url=" };
+  if (/\.m3u8?(?:\?|#|$)/i.test(String(target))) {
+    return { ok: false, status: 415, error: "HLS playlists are not remuxed" };
+  }
 
   const vcodec = String(searchParams.get("vcodec") || "").trim().toLowerCase();
   if (vcodec && vcodec !== "h264") {
@@ -407,5 +558,6 @@ module.exports = {
   stopRemux,
   parseRemuxQuery,
   buildFfmpegArgs,
+  planRemux,
   sanitizeFfmpegBinary,
 };
