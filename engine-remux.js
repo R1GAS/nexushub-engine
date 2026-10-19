@@ -219,7 +219,7 @@ function deprioritizeRemux(child) {
 function buildFfmpegArgs(targetUrl, { transcodeVideo = false } = {}) {
   const threads = ffmpegThreadCount();
   const videoArgs = transcodeVideo
-    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-threads", threads]
+    ? ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23", "-pix_fmt", "yuv420p", "-threads", threads]
     : ["-c:v", "copy"];
   return [
     "-hide_banner",
