@@ -1,0 +1,15 @@
+{
+  "name": "nexushub-engine",
+  "version": "0.4.10",
+  "private": true,
+  "description": "NexusHub Desktop Engine — local loopback media proxy + FFmpeg remux (public review source)",
+  "main": "engine-main.js",
+  "scripts": {
+    "start": "node engine-main.js",
+    "diagnostics": "node engine-main.js --diagnostics",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
